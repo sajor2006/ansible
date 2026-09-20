@@ -1,3 +1,6 @@
+ansible-playbook -i '135.106.***.230,' proxy.yml -u root
+
+
 # 1. Переходим в рабочую директорию OpenVPN (где создавалась PKI сервера)
 cd /etc/openvpn
 
