@@ -93,26 +93,13 @@
           -A INPUT -p icmp -m icmp --icmp-type 8 -j ACCEPT
           -A INPUT -p icmp -f -j DROP
           -A INPUT -p tcp -m conntrack --ctstate NEW -m tcp --dport 22 -j ACCEPT
-          -A INPUT -p udp -m udp --dport {{ vpn_proto }} -j ACCEPT
+          -A INPUT -p udp -m udp --dport {{ vpn_port }} -j ACCEPT
           -A INPUT -i tun+ -j ACCEPT
           
           # 4. ПОЛНЫЙ СБРОС ВСЕГО ОСТАЛЬНОГО
           -A INPUT -j REJECT --reject-with icmp-host-prohibited
           -A FORWARD -j REJECT --reject-with icmp-host-prohibited
           COMMIT
-          
-          *nat
-          :PREROUTING ACCEPT [210:19098]
-          :INPUT ACCEPT [178:11216]
-          :OUTPUT ACCEPT [126:7644]
-          :POSTROUTING ACCEPT [130:12756]
-          -A PREROUTING -d 127.0.0.0/8 -j RETURN
-          # redsocks
-          -A PREROUTING -p tcp -m tcp --dport 12345 -j RETURN
-          -A PREROUTING -p tcp -m tcp --dport 9898 -j RETURN
-          -A PREROUTING -s {{ vpn_network }}/24 -p tcp -j REDIRECT --to-ports 12345
-          COMMIT
-
     - name: Enable and restart iptables service
       service:
         name: iptables
