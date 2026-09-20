@@ -1,0 +1,109 @@
+---
+- name: Deploy OpenVPN, IPTables, and Aggressive Fail2ban on AlmaLinux
+  hosts: all
+  become: yes
+    # =====================================================================
+    # 6. СБОРКА И НАСТРОЙКА REDSOCKS2 (semigodking)
+    # Поможет завернуть трафик в socks, если обращение идет не на конкретный порт 
+    # (удобно для мобильных устройств)
+    # к примеру openwvpn или wireguard завернуть в socks на сервере.
+    # =====================================================================
+  tasks:
+    - name: Install prerequisite libraries for Redsocks2
+      dnf:
+        name:
+          - gcc
+          - make
+          - git
+          - libevent-devel
+          - openssl-devel
+        state: present
+
+    - name: Clone semigodking Redsocks2 repository
+      git:
+        repo: 'https://github.com/semigodking/redsocks.git'
+        dest: /usr/local/src/redsocks
+        version: master
+        force: yes
+
+    - name: Build Redsocks2 from source with OpenSSL support
+      command: make
+      args:
+        chdir: /usr/local/src/redsocks
+        creates: /usr/local/src/redsocks
+
+    - name: Copy Redsocks2 binary to system bin directory
+      copy:
+        src: /usr/local/src/redsocks
+        dest: /usr/local/bin
+        mode: '0755'
+        remote_src: yes
+
+    - name: Create Redsocks configuration directory
+      file:
+        path: /etc/redsocks
+        state: directory
+        mode: '0755'
+
+    - name: Deploy Redsocks2 configuration file
+      copy:
+        dest: /etc/redsocks/redsocks.conf
+        content: |
+          base {
+           log_debug = off;
+           log_info = on;
+           daemon = on;
+           redirector = iptables;
+          }
+
+          redsocks {
+           bind = "0.0.0.0:12345"; 
+           relay = "127.0.0.1:9898"; 
+           type = socks5;
+           autoproxy = 0;
+          }
+    - name: Generate iptables rules configuration file
+      copy:
+        dest: /etc/sysconfig/iptables
+        content: |
+          *filter
+          :INPUT ACCEPT [0:0]
+          :FORWARD ACCEPT [0:0]
+          :OUTPUT ACCEPT [0:0]
+          COMMIT
+          
+          *nat
+          :PREROUTING ACCEPT [210:19098]
+          :INPUT ACCEPT [178:11216]
+          :OUTPUT ACCEPT [126:7644]
+          :POSTROUTING ACCEPT [130:12756]
+          -A PREROUTING -d 127.0.0.0/8 -j RETURN
+          # redsocks
+          -A PREROUTING -p tcp -m tcp --dport 12345 -j RETURN
+          -A PREROUTING -p tcp -m tcp --dport 9898 -j RETURN
+          -A PREROUTING -s {{ vpn_network }}/24 -p tcp -j REDIRECT --to-ports 12345
+          COMMIT
+
+    - name: Create systemd service unit for Redsocks
+      copy:
+        dest: /etc/systemd/system/redsocks.service
+        content: |
+          [Unit]
+          Description=Redsocks2 Transparent Proxy Redirector
+          After=network.target
+
+          [Service]
+          Type=forking
+          PIDFile=/usr/local/src/redsocks/redsocks.pid
+          ExecStart=/usr/local/bin/redsocks/redsocks2 -c /etc/redsocks/redsocks.conf -p /usr/local/src/redsocks/redsocks.pid
+          Restart=on-failure
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd, enable and start Redsocks service
+      systemd:
+        name: redsocks
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
