@@ -1,0 +1,251 @@
+---
+- name: Deploy OpenVPN, IPTables, and Aggressive Fail2ban on AlmaLinux
+  hosts: all
+  become: yes
+  vars:
+    vpn_port: 2194
+    vpn_proto: udp
+    vpn_network: "10.8.0.0"
+    vpn_netmask: "255.255.255.0"
+
+  tasks:
+    # =====================================================================
+    # 1. ОТКЛЮЧЕНИЕ FIREWALLD И SELINUX
+    # =====================================================================
+    - name: Stop and disable firewalld (if installed)
+      ansible.builtin.systemd_service:
+        name: firewalld
+        state: stopped
+        enabled: no
+      failed_when: false # Игнорирует ошибку, если сервиса firewalld нет в системе
+
+
+    - name: Disable SELinux permanently in config
+      selinux:
+        state: disabled
+
+    - name: Disable SELinux immediately in memory
+      command: setenforce 0
+      failed_when: false
+
+    # =====================================================================
+    # 2. УСТАНОВКА ПАКЕТОВ И РЕПОЗИТОРИЕВ
+    # =====================================================================
+    - name: Install EPEL repository
+      dnf:
+        name: epel-release
+        state: present
+
+    - name: Install OpenVPN, Easy-RSA, IPTables services, and Fail2ban
+      dnf:
+        name:
+          - openvpn
+          - easy-rsa
+          - iptables-services
+          - fail2ban
+          - screen
+          - autossh
+        state: present
+        update_cache: yes
+
+    - name: Enable IP forwarding in sysctl
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+
+    # =====================================================================
+    # 3. НАСТРОЙКА ПРАВИЛ IPTABLES (Systemd-скрипты)
+    # =====================================================================
+    - name: Generate iptables rules configuration file
+      copy:
+        dest: /etc/sysconfig/iptables
+        content: |
+          *filter
+          :INPUT ACCEPT [0:0]
+          :FORWARD ACCEPT [0:0]
+          :OUTPUT ACCEPT [0:0]
+          
+          # 1. ЛОКАЛЬНЫЙ ТРАФИК И СВЯЗЬ
+          -A INPUT -i lo -j ACCEPT
+          -A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+          
+          # 2. ФИЛЬТРАЦИЯ СЕТЕВОГО МУСОРА И АТАК
+          -A INPUT -m conntrack --ctstate INVALID -j DROP
+          -A INPUT -p tcp -m tcp ! --tcp-flags FIN,SYN,RST,ACK SYN -m conntrack --ctstate NEW -j DROP
+          -A INPUT -f -j DROP
+          -A INPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,PSH,ACK,URG NONE -j DROP
+          -A INPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,PSH,ACK,URG FIN,SYN,RST,PSH,ACK,URG -j DROP
+          -A INPUT -p tcp -m tcp --tcp-flags FIN,SYN FIN,SYN -j DROP
+          -A INPUT -p tcp -m tcp --tcp-flags SYN,RST SYN,RST -j DROP
+          -A INPUT -p tcp -m tcp --tcp-flags FIN,RST FIN,RST -j DROP
+          -A INPUT -p tcp -m tcp --tcp-flags FIN,ACK FIN -j DROP
+          -A INPUT -p tcp -m tcp --tcp-flags ACK,URG URG -j DROP
+          -A INPUT -p tcp -m tcp --tcp-flags PSH,ACK PSH -j DROP
+          -A INPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,PSH,ACK,URG FIN,PSH,URG -j DROP
+          -A INPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,PSH,ACK,URG FIN,SYN,PSH,URG -j DROP
+          -A INPUT -p tcp -m tcp --tcp-flags FIN,SYN,RST,PSH,ACK,URG FIN,SYN,RST,ACK,URG -j DROP
+          
+          # 3. РАЗРЕШЕННЫЕ СЕРВИСЫ
+          -A INPUT -p icmp -m icmp --icmp-type 0 -j ACCEPT
+          -A INPUT -p icmp -m icmp --icmp-type 8 -j ACCEPT
+          -A INPUT -p icmp -f -j DROP
+          -A INPUT -p tcp -m conntrack --ctstate NEW -m tcp --dport 22 -j ACCEPT
+          -A INPUT -p udp -m udp --dport {{ vpn_proto }} -j ACCEPT
+          -A INPUT -i tun+ -j ACCEPT
+          
+          # 4. ПОЛНЫЙ СБРОС ВСЕГО ОСТАЛЬНОГО
+          -A INPUT -j REJECT --reject-with icmp-host-prohibited
+          -A FORWARD -j REJECT --reject-with icmp-host-prohibited
+          COMMIT
+          
+          *nat
+          :PREROUTING ACCEPT [210:19098]
+          :INPUT ACCEPT [178:11216]
+          :OUTPUT ACCEPT [126:7644]
+          :POSTROUTING ACCEPT [130:12756]
+          -A PREROUTING -d 127.0.0.0/8 -j RETURN
+          # redsocks
+          -A PREROUTING -p tcp -m tcp --dport 12345 -j RETURN
+          -A PREROUTING -p tcp -m tcp --dport 9898 -j RETURN
+          -A PREROUTING -s {{ vpn_network }}/24 -p tcp -j REDIRECT --to-ports 12345
+          COMMIT
+
+    - name: Enable and restart iptables service
+      service:
+        name: iptables
+        state: restarted
+        enabled: yes
+
+    # =====================================================================
+    # 4. НАСТРОЙКА FAIL2BAN (Агрессивный режим SSH)
+    # =====================================================================
+    - name: Disable firewalld integration in Fail2ban
+      ansible.builtin.file:
+        path: /etc/fail2ban/jail.d/00-firewalld.conf
+        state: absent
+
+    - name: Create aggressive SSH and Recidive configuration inside jail.d
+      copy:
+        dest: /etc/fail2ban/jail.d/sshd.local
+        content: |
+          [DEFAULT]
+          # Белый список IP (добавьте свои IP через пробел, если нужно)
+          ignoreip = 127.0.0.1/8 ::1
+          bantime  = 1h
+          findtime = 10m
+          maxretry = 3
+          banaction = iptables-multiport
+          banaction_allports = iptables-allports
+
+          # Агрессивный мониторинг SSH
+          [sshd]
+          enabled = true
+          port    = ssh
+          backend = systemd
+          mode    = aggressive
+
+          # Постоянный бан для тех, кто часто попадается (Рецидивисты)
+          [recidive]
+          enabled  = true
+          logpath  = /var/log/fail2ban.log
+          banaction = iptables-allports
+          bantime  = 1w
+          findtime = 1d
+          maxretry = 2
+
+    - name: Enable and start Fail2ban service
+      service:
+        name: fail2ban
+        state: restarted
+        enabled: yes
+
+    # =====================================================================
+    # 5. НАСТРОЙКА СЕРВЕРА OPENVPN
+    # =====================================================================
+    - name: Create Easy-RSA directory structure
+      command: "/usr/share/easy-rsa/3/easyrsa init-pki"
+      args:
+        chdir: /etc/openvpn
+        creates: /etc/openvpn/pki
+
+    - name: Build Certificate Authority (CA) without passphrase
+      command: "/usr/share/easy-rsa/3/easyrsa --batch build-ca nopass"
+      args:
+        chdir: /etc/openvpn
+        creates: /etc/openvpn/pki/ca.crt
+
+    - name: Generate Diffie-Hellman parameters
+      command: "/usr/share/easy-rsa/3/easyrsa gen-dh"
+      args:
+        chdir: /etc/openvpn
+        creates: /etc/openvpn/pki/dh.pem
+
+    - name: Generate Server Certificate and Private Key
+      command: "/usr/share/easy-rsa/3/easyrsa --batch gen-req server nopass"
+      args:
+        chdir: /etc/openvpn
+        creates: /etc/openvpn/pki/private/server.key
+
+    - name: Sign Server Certificate
+      command: "/usr/share/easy-rsa/3/easyrsa --batch sign-req server server"
+      args:
+        chdir: /etc/openvpn
+        creates: /etc/openvpn/pki/issued/server.crt
+
+    - name: Generate TLS-Auth key for additional security
+      command: "openvpn --genkey secret /etc/openvpn/ta.key"
+      args:
+        creates: /etc/openvpn/ta.key
+
+    - name: Ensure logs directory exists with correct permissions
+      file:
+        path: /var/log/openvpn
+        state: directory
+        owner: nobody
+        group: nobody
+        mode: '0755'
+
+    - name: Create OpenVPN server configuration file
+      copy:
+        dest: /etc/openvpn/server/server.conf
+        content: |
+          port {{ vpn_port }}
+          proto {{ vpn_proto }}
+          dev tun
+          ca /etc/openvpn/pki/ca.crt
+          cert /etc/openvpn/pki/issued/server.crt
+          key /etc/openvpn/pki/private/server.key
+          dh /etc/openvpn/pki/dh.pem
+          tls-auth /etc/openvpn/ta.key 0
+          server {{ vpn_network }} {{ vpn_netmask }}
+          ifconfig-pool-persist ipp.txt
+          
+          #push "redirect-gateway def1 bypass-dhcp"
+          #push "dhcp-option DNS 8.8.8.8"
+          #push "dhcp-option DNS 8.4.4.4"
+          
+          keepalive 10 120
+          cipher AES-256-GCM
+          user nobody
+          group nobody
+          persist-tun
+          verb 3
+          explicit-exit-notify 1
+          log-append /var/log/openvpn/openvpn.log
+          status /var/log/openvpn/openvpn-status.log
+
+    - name: Set nobody owner recursively for OpenVPN directory
+      ansible.builtin.file:
+        path: /etc/openvpn
+        owner: nobody
+        group: nobody
+        recurse: yes
+
+    - name: Enable and restart OpenVPN service
+      service:
+        name: openvpn-server@server
+        state: restarted
+        enabled: yes
