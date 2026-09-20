@@ -14,7 +14,7 @@ export EASYRSA_TEMP_DIR="/tmp"
 /usr/share/easy-rsa/3/easyrsa --batch sign-req client Dima
 
 # /bin/cp -v /etc/openvpn/pki/ca.crt /etc/openvpn/ta.key /etc/openvpn/pki/private/Dima.key /etc/openvpn/pki/issued/Dima.crt  /tmp/
-tar -cvf dima.tar ca.crt Dima.* ta.key
+cd /tmp && tar -cvf dima.tar ca.crt Dima.* ta.key
 
 # с vpn узла подключаюсь к proxy
 screen -> autossh -M 0 -N -D 0.0.0.0:9898 root@ip_proxy_за_границей
